@@ -13,46 +13,86 @@ import pandas as pd
 
 
 # background_mode = "realtime_MOG2" # prerun_MOG2, realtime_MOG2, median, 
+cars_to_track = []
+with open('cars_to_track.csv', 'r') as f:
+    cars_to_track = [int(line[:-1]) for line in f]
 
 
-
-
-def getBackground(background_mode, video_file, history=500):
+def getBackground(background_mode, video_file, history=500, background_image='background.png', save_background=False):
+    print(f'Defining the background using the {background_mode} method...')
     video_file = Path(video_file)
+    background_image = Path(background_image)
+            
+    kernel3 = np.ones((3, 3), 'uint8')
+    kernel5 = np.ones((5, 5), 'uint8')
+     
+    def fixedForeground(frame):
+        fgd = cv2.absdiff(frame, background)
+        fgd = cv2.cvtColor(fgd, cv2.COLOR_BGR2GRAY)
+        _, fgd = cv2.threshold(fgd, 18, 255, cv2.THRESH_BINARY)
+        cv2.morphologyEx(src=fgd, dst=fgd, op=cv2.MORPH_DILATE, kernel=kernel3)
+
+        return fgd
     
-    print(background_mode)
+    def MOG2Foreground(frame):
+        fgd = fgbg.apply(frame)
+        cv2.morphologyEx(src=fgd, dst=fgd, op=cv2.MORPH_OPEN, kernel=kernel3)
+        cv2.morphologyEx(src=fgd, dst=fgd, op=cv2.MORPH_CLOSE, kernel=kernel3)
+        return fgd
+    
+    if background_mode == 'median':
+        cap = cv2.VideoCapture(str(video_file))
+        FOI = cap.get(cv2.CAP_PROP_FRAME_COUNT) * np.random.uniform(size=history)
+    
+        frames = []
+        for frameOI in FOI:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frameOI)
+            ret, frame = cap.read()
+            frames.append(frame)
+        
+        background = np.median(frames, axis=0).astype(dtype=np.uint8)
+        if save_background: cv2.imwrite(str(background_image), background)
+        
+        getForeground = fixedForeground
+        
     if background_mode == 'prerun_MOG2':
         fgbg = cv2.createBackgroundSubtractorMOG2(history = history, detectShadows=True)
         fgbg.setShadowValue(0)
-        cv2.destroyAllWindows()
-        
-        kernel3 = np.ones((3, 3), 'uint8')
-        kernel5 = np.ones((5, 5), 'uint8')
-        
-        #background = cv2.imread(str(folder / "background.png"))
-        
+
         cap = cv2.VideoCapture(str(video_file))
         framecount = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         ret, frame = cap.read()
-        #fgbg.apply(frame)
         
         bar = tqdm(total=framecount, position=0, leave=True, desc="MOG2")
         while ret:
             bar.update(1)
             fgbg.apply(frame)
             ret, frame = cap.read()
-            
+        cap.release()
+        
         background = fgbg.getBackgroundImage()
+        if save_background: cv2.imwrite(str(background_image), background)
         
-        def getForeground(frame):
-            fgd = fgbg.apply(frame)
-     
-            cv2.morphologyEx(src=fgd, dst=fgd, op=cv2.MORPH_OPEN, kernel=kernel3)
-            # closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel3)
-            
-            return fgd
+        getForeground = MOG2Foreground
+
+    if background_mode == 'realtime_MOG2':
+        fgbg = cv2.createBackgroundSubtractorMOG2(history = history, detectShadows=True)
+        fgbg.setShadowValue(0)
         
-        return background, getForeground
+        cap = cv2.VideoCapture(str(video_file))
+        ret, frame = cap.read()
+        background = frame # first frame as temporary background
+        cap.release()
+        
+        getForeground = MOG2Foreground
+
+    if background_mode == 'load_image':
+        print(f'Loading {background_image.resolve()}')
+        background = cv2.imread(str(background_image))
+        getForeground = fixedForeground
+        
+    return background, getForeground
+        
 
 def frametime(video_file, timebox, display=True, expected_fps=30):
     video_file = Path(video_file)
@@ -193,6 +233,7 @@ def isInBBox(point, bbox):
 def getTime(video_file, background, expected_fps=30, useClock=False):
     video_file = Path(video_file)
     if useClock:
+        print('Please select clock window')
         timeBox = get_box(background, 'time box selection')
         frame2time, frameBounds, fps = frametime(video_file, timeBox, display=False, expected_fps=expected_fps)
         return frame2time, frameBounds, fps
@@ -282,7 +323,7 @@ def displayContourRect(l_contours, image, BBox=None, color=(0,255,0), thickness=
             rect = cv2.minAreaRect(contour)
             box = cv2.boxPoints(rect)
             box = np.int0(box)
-            cv2.drawContours(img, [box], 0, color, thickness)
+            cv2.drawContours(image, [box], 0, color, thickness)
             
             #cv2.rectangle(image, (x1, y1), (x2, y2),color, thickness)
     else:
@@ -292,7 +333,7 @@ def displayContourRect(l_contours, image, BBox=None, color=(0,255,0), thickness=
                 rect = cv2.minAreaRect(contour)
                 box = cv2.boxPoints(rect)
                 box = np.int0(box)
-                cv2.drawContours(img, [box], 0, color, thickness)
+                cv2.drawContours(image, [box], 0, color, thickness)
 
 def matching2(centroids, car_list):
     carIds = np.array([car.id for car in car_list if car.visible])
@@ -349,8 +390,13 @@ class Car:
     def calculate_speed(self, location):
         self.speed[0] = (location[0] - self.coordinates[0])/self.idle
         self.speed[1] = (location[1] - self.coordinates[1])/self.idle
-        self.EMAspeed[0] = self.speed[0]*self.EMAalpha + self.EMAspeed[0]*( 1-(self.EMAalpha)**self.idle )
-        self.EMAspeed[1] = self.speed[1]*self.EMAalpha + self.EMAspeed[1]*( 1-(self.EMAalpha)**self.idle )
+        
+        if self.EMAspeed == [0,0]:
+            self.EMAspeed[0] = self.speed[0]
+            self.EMAspeed[1] = self.speed[1]
+        else:    
+            self.EMAspeed[0] = self.speed[0]*self.EMAalpha + self.EMAspeed[0]*( 1-(self.EMAalpha)**self.idle )
+            self.EMAspeed[1] = self.speed[1]*self.EMAalpha + self.EMAspeed[1]*( 1-(self.EMAalpha)**self.idle )
 
     def scalar_speed(self):
         return (self.speed[0]**2 + self.speed[1]**2)**0.5
@@ -451,8 +497,13 @@ def displayVisibleCars(image, car_list, color=(0,255,255)):
     for car in car_list:
         if car.visible:
             [x,y] = car.coordinates
+            
+            if car.id in cars_to_track:
+                cv2.putText(image, f"{car.id}", (max(int(x)-10,0), min(int(y)+10, y_max)),
+                            cv2.FONT_HERSHEY_PLAIN, 1.5, (255,0,0), 2)
+                continue
             cv2.putText(image, f"{car.id}", (max(int(x)-10,0), min(int(y)+10, y_max)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                            cv2.FONT_HERSHEY_PLAIN, 1.5, color, 2)
 
 def displayCarVectors(image, car_list, color=[255,128,128], speed_scale_factor=3):
     f = speed_scale_factor
@@ -470,8 +521,36 @@ def displayLostCars(image, car_list, color=(0,0,255)):
     for car in car_list:
         if car.exitCard == 'Lost':
             [x,y] = car.coordinates
-            cv2.putText(image, f"car {car.id}", (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)  
-       
+            cv2.putText(image, f"car {car.id}", (int(x), int(y)), cv2.FONT_HERSHEY_PLAIN, 1.5, color, 2)  
+
+
+def logInLoop(car_list, currentTime, logFile):
+    pass
+def logCarsInfo(enableLogCarsInfo = False, logFile = 'car_log.txt', parameters = {}):
+    logFile = Path(logFile)  
+    
+    if enableLogCarsInfo:
+        print(f'Logging car infos to {logFile.resolve()}')
+        with logFile.open('w') as f:
+            f.write('[Parameters]\n')
+            for k, v in parameters.items():
+                f.write(f'{k}: {v}\n')
+            f.write('\n')
+            f.write('[FORMAT]\n')
+            f.write('id;coordinates;speed;EMAspeed')
+            f.write('\n')
+            f.write('[DATA]\n')
+        def logInLoop(car_list, currentTime, logFile):
+            with logFile.open('a') as f:
+                f.write(f'{currentTime}\t')
+                f.write('\t'.join([f'{car.id};{car.coordinates};{car.speed};{car.EMAspeed}' for car in car_list if car.visible]))
+                f.write('\n')
+        return logFile, logInLoop
+    
+    else:
+        return None, logInLoop
+        
+        
 def displayBBox(image, detection_bbox, color=(255, 0, 0)):
     [WB, NB, EB, SB] = detection_bbox
     cv2.rectangle(image, (WB, NB), (EB, SB), color, 2)
@@ -498,7 +577,7 @@ def Display(image, display_size, outVideo=None):
 
 def main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox, myEMA,
               detection_size=100, display_size = (1280,720), drawContourShape=True, drawContourRect=True,
-              showVisibleCars=True, showCarVectors=True, showLostCars=False):
+              showVisibleCars=True, showCarVectors=True, showLostCars=False, logFile='car_log.txt', logInLoop=logInLoop):
     
     video_file = Path(video_file)
     cap = cv2.VideoCapture(str(video_file))
@@ -531,7 +610,7 @@ def main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox
         contours, _ = cv2.findContours(foreground, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         foreground = cv2.cvtColor(foreground, cv2.COLOR_GRAY2RGB)
         
-        contours = [contour for contour in contours if cv2.contourArea(contour) < detection_size]
+        contours = [contour for contour in contours if cv2.contourArea(contour) > detection_size]
         
         centroids = [contourCenter(contour) for contour in contours]
         
@@ -543,6 +622,7 @@ def main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox
         matched_id = matching2(centroids, car_list)
         update_cars_positions(car_list, centroids, matched_id, detection_bbox, currentTime)
         update_cars_status(car_list, detection_bbox, currentTime, myEMA, max_idle=50)
+        logInLoop(car_list, currentTime, logFile)
         
         if showVisibleCars: displayVisibleCars(frame, car_list, color=(0,255,255))
         if showCarVectors: displayCarVectors(foreground, car_list, color=[255,128,128], speed_scale_factor=3)
@@ -551,11 +631,11 @@ def main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox
         displayBBox(frame, detection_bbox, color=(255, 0, 0))
         
         if Display(foreground, display_size): break
-    
+    cap.release()
     bar.close()
-    return car_list
+    return car_list, currentTime
 
-def printStats(car_list, frame2time, frameBounds):
+def printStats(car_list, frame2time, currentTime, min_validDelay=0.1, result_file=None):
     
     dataframe = [ [car.id, car.entryCard, car.exitCard, car.entryTime, car.exitTime] for car in car_list]
     car_df = pd.DataFrame(dataframe, columns=["Car",
@@ -563,16 +643,31 @@ def printStats(car_list, frame2time, frameBounds):
                                               "Cardinal of exit",
                                               "Time of entry",
                                               "Time of exit"])
+    car_df["Delay"] = car_df["Time of exit"] - car_df["Time of entry"]
     
     entered_condition = car_df["Time of entry"]>0.01
     exited_condition = car_df["Cardinal of exit"].isin(["North", "South", "East", "West"])
+    delay_condition = car_df["Delay"] > min_validDelay
     
-    total_time = round(frame2time[frameBounds[1]]-(car_df[entered_condition]["Time of entry"]).min())
+    total_time = currentTime-(car_df[entered_condition]["Time of entry"]).min()
     throughput = exited_condition.sum(axis=0)/total_time
+    print('\n')
+    print(f"Number cars that went through: {np.count_nonzero(entered_condition & exited_condition & delay_condition)}")
+    print(f"Number of lost cars: {np.count_nonzero(car_df['Cardinal of exit']=='Lost')}")
+    print(f"Number of cars who disappeared within {round(min_validDelay, 3)}s: {np.count_nonzero(entered_condition & exited_condition & (1-delay_condition))}")
+    print('\n')
     print(f"\nIntersection throughput : {round(throughput,2)} veh/s (or {round(60*throughput)} veh/min) for {total_time} seconds")
-
+    
+    df_OD = car_df[entered_condition & exited_condition & delay_condition]
+    
+    if result_file is not None:
+        result_file = Path(result_file)
+        df_OD.to_csv(result_file.parent/(result_file.stem+'_valid'+result_file.suffix), index=False)
+        car_df.to_csv(result_file.parent/(result_file.stem+'_all'+result_file.suffix), index=False)
 
 if __name__ == '__main__':
+    cv2.destroyAllWindows()
+    plt.close('all')
     
     config = configparser.ConfigParser()
     config.read('configFile.ini')
@@ -581,15 +676,22 @@ if __name__ == '__main__':
     video_file = folder / config.get('main', 'video_file')
     
     
-    background_mode = (config.get('main', 'background_mode'))
+    background_mode = config.get('main', 'background_mode')
     
-    background, getForeground = getBackground(background_mode, video_file)
+    background_image='background.png'
+    if background_mode == 'load_image':
+        background_image = config.get('main', 'background_image')
+        
+    background_history = int(config.get('main', 'background_history'))
+    background, getForeground = getBackground(background_mode, video_file, background_image=background_image, history=background_history)
     
     expected_fps = float(config.get('main', 'expected_fps'))
     useClock = (config.get('main', 'useClock')).lower() in ('true', '1', 'y', 'yes')
     frame2time, frameBounds, fps = getTime(video_file, background, expected_fps, useClock)
-
-    [WB, NB, EB, SB] = get_box(background, 'detection box')
+    
+    # print('Please select detection window')
+    # [WB, NB, EB, SB] = get_box(background, 'detection box')
+    [WB, NB, EB, SB] = [796, 301, 1292, 798]
     center = [int((NB+SB)/2), int((WB+EB)/2)]
     detection_bbox = [WB, NB, EB, SB]
     
@@ -597,7 +699,14 @@ if __name__ == '__main__':
     refreshPeriod = 0.25
     myEMA = EMA(MA_window, fps, refreshPeriod, doubleEMA=True)
     
-    car_list = main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox, myEMA)
-    printStats(car_list, frame2time, frameBounds)
+    parameters = {'video_file':video_file.name,
+                  'background_mode':background_mode,
+                  'background_history':background_history,
+                  'useClock':useClock,
+                  'expected_fps':expected_fps}
+    logFile, logInLoop = logCarsInfo(enableLogCarsInfo = True, logFile = 'car_log.txt', parameters = parameters)
+    
+    car_list, currentTime = main_loop(video_file, frame2time, frameBounds, getForeground, detection_bbox, myEMA, logFile=logFile, logInLoop=logInLoop)
+    printStats(car_list, frame2time, currentTime, result_file='car_OD.csv')
     
     
